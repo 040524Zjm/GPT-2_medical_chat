@@ -2,9 +2,10 @@
 
 基于 GPT-2 模型构建的医疗健康咨询聊天机器人，使用 Flask 提供 Web 界面。本项目实现了从数据预处理、模型训练到部署的完整流程，支持多轮对话和上下文理解。
 
-**数据处理**：格式转换、张量转换，封装 DataSet 与 DataLoader 对象，适配模型输入规范；
-**设计模型训练策略**，完成模型Train、Validate全流程，使用Top-P发散式生成、温度调节，对话history，加入惩罚系数，Warmup学习率调节，使用驱动云算力平台；
-**人机交互实现**：开发模型预测模块，使用Flask框架开发API接口，实现机器人上线应用。
+- **数据处理**：格式转换、张量转换，封装 DataSet 与 DataLoader 对象，适配模型输入规范；
+- **设计模型训练策略**，完成模型Train、Validate全流程，使用Top-P发散式生成、温度调节，对话history，加入惩罚系数，Warmup学习率调节，使用驱动云算力平台；
+
+- **人机交互实现**：开发模型预测模块，使用Flask框架开发API接口，实现机器人上线应用。
 
 ## ✨ 功能特点
 
@@ -53,7 +54,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 由于模型文件较大，无法直接包含在 Git 仓库中。你需要：
 
 1. **下载预训练模型**：
-   - 将训练好的模型文件放置在 `save_model/epoch97/` 目录下
+   - 将训练好的模型文件放置在 `save_model/epoch97/` 目录下 （或自定义目录此epoch97只是训练好的模型）
    - 模型目录应包含：
      - `config.json` - 模型配置文件
      - `pytorch_model.bin` 或 `model.safetensors` - 模型权重文件
@@ -340,7 +341,7 @@ app.run(debug=True, port=5000)  # 修改 port 参数
 
 ## 📮 联系方式
 
-[添加你的联系方式]
+[无]
 
 ## 🙏 致谢
 
