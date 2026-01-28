@@ -3,9 +3,190 @@
 基于 GPT-2 模型构建的医疗健康咨询聊天机器人，使用 Flask 提供 Web 界面。本项目实现了从数据预处理、模型训练到部署的完整流程，支持多轮对话和上下文理解。
 
 - **数据处理**：格式转换、张量转换，封装 DataSet 与 DataLoader 对象，适配模型输入规范；
-- **设计模型训练策略**，完成模型Train、Validate全流程，使用Top-P发散式生成、温度调节，对话history，加入惩罚系数，Warmup学习率调节，使用驱动云算力平台；
+- **设计模型训练策略**：完成 Train / Validate 全流程，使用 Top-P 发散式生成、对话 history、惩罚系数、Warmup 学习率调节等；
+- **人机交互实现**：开发模型预测模块，使用 Flask 框架开发 API 接口，实现机器人上线应用。
 
-- **人机交互实现**：开发模型预测模块，使用Flask框架开发API接口，实现机器人上线应用。
+## 🔄 项目实现流程与核心代码片段
+
+### 1. 数据预处理与数据集构建
+
+将原始多轮对话文本转为模型可用的 ID 序列，并保存为 `pkl` 文件（节选自 `data_preprocess/preprocess.py`）：
+
+```python
+tokenizer = BertTokenizer(
+    '../vocab/vocab.txt',
+    sep_token='[SEP]',
+    pad_token='[PAD]',
+    cls_token='[CLS]',
+)
+
+with open(train_txt_path, 'rb') as f:
+    data = f.read().decode('utf-8')
+
+if '\r\n' in data:
+    train_data = data.split('\r\n\r\n')
+else:
+    train_data = data.split('\n\n')
+
+dialogue_list = []
+for dialogue in train_data:
+    sequences = dialogue.split('\r\n') if '\r\n' in dialogue else dialogue.split('\n')
+    input_ids = [tokenizer.cls_token_id]
+    for sequence in sequences:
+        input_ids += tokenizer.encode(sequence, add_special_tokens=False)
+        input_ids.append(tokenizer.sep_token_id)
+    dialogue_list.append(input_ids)
+
+with open(train_pkl_path, 'wb') as f:
+    pickle.dump(dialogue_list, f)
+```
+
+之后通过 `dataset.py` / `dataloader.py` 将 `pkl` 数据封装为 `Dataset` 和 `DataLoader`，完成张量化和批处理。
+
+### 2. 模型训练与验证流程
+
+训练流程包括单个 epoch 的前向、反向与梯度更新，以及基于验证集的最优模型保存（节选自 `train.py`）：
+
+```python
+def train_epoch(model, train_dataloader, optimizer, scheduler, epoch, args):
+    model.train()
+    device = args.device
+    ignore_index = args.ignore_index
+    total_loss = 0
+
+    for batch_idx, (input_ids, labels) in enumerate(train_dataloader):
+        input_ids = input_ids.to(device)
+        labels = labels.to(device)
+
+        outputs = model(input_ids, labels=labels)
+        logits = outputs.logits
+        loss = outputs.loss.mean()
+
+        batch_correct_num, batch_total_num = calculate_acc(logits, labels, ignore_index=ignore_index)
+        if args.gradient_accumulation_steps > 1:
+            loss = loss / args.gradient_accumulation_steps
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+        if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+```
+
+训练主函数负责：初始化配置、构建 tokenizer 与 GPT-2 模型、加载数据、调用训练与验证，并基于验证集损失保存最优模型：
+
+```python
+params = ParameterConfig()
+tokenizer = BertTokenizerFast(
+    params.vocab_path,
+    sep_token='[SEP]',
+    pad_token='[PAD]',
+    cls_token='[CLS]',
+)
+
+if params.pretrained_model:
+    model = GPT2LMHeadModel.from_pretrained(params.pretrained_model)
+else:
+    model_config = GPT2Config.from_pretrained(params.config_json)
+    model = GPT2LMHeadModel(config=model_config)
+model = model.to(params.device)
+
+train_dataloader, validate_dataloader = get_dataloader(params.valid_path, params.valid_path)
+train(model, train_dataloader, validate_dataloader, params)
+```
+
+训练中使用 **学习率预热（Warmup）** 和 **梯度裁剪** 等策略，提升收敛稳定性。
+
+### 3. 对话生成策略（Top-K / Top-P + 重复惩罚）
+
+推理阶段通过 Top-K + Top-P 采样配合重复惩罚，控制生成多样性与稳定性（节选自 `flask_predict.py`）：
+
+```python
+def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
+    assert logits.dim() == 1
+    top_k = min(top_k, logits.size(-1))
+
+    if top_k > 0:
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = filter_value
+    return logits
+```
+
+结合对话历史与采样策略的生成函数（节选）：
+
+```python
+def model_predict(text):
+    history = []
+    text_ids = tokenizer.encode(text, add_special_tokens=False)
+    history.append(text_ids)
+
+    input_ids = [tokenizer.cls_token_id]
+    for history_utr in history[-pconf.max_history_len:]:
+        input_ids.extend(history_utr)
+        input_ids.append(tokenizer.sep_token_id)
+
+    input_ids = torch.tensor(input_ids).long().to(device).unsqueeze(0)
+    response = []
+
+    for _ in range(pconf.max_len):
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits
+        next_token_logits = logits[0, -1, :]
+
+        for id in set(response):
+            next_token_logits[id] /= pconf.repetition_penalty
+        next_token_logits[tokenizer.convert_tokens_to_ids('[UNK]')] = -float('Inf')
+
+        filtered_logits = top_k_top_p_filtering(
+            next_token_logits, top_k=pconf.topk, top_p=pconf.topp
+        )
+        next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+        if next_token == tokenizer.sep_token_id:
+            break
+
+        response.append(next_token.item())
+        input_ids = torch.cat((input_ids, next_token.unsqueeze(0)), dim=1)
+
+    text = tokenizer.convert_ids_to_tokens(response)
+    return ''.join(text)
+```
+
+### 4. 人机交互与部署（Flask Web）
+
+通过 Flask 提供 Web 界面，实现前端表单输入与模型后端推理的打通（节选自 `app.py`）：
+
+```python
+from flask import Flask, render_template, request
+from flask_predict import model_predict
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    user_input = request.form['user_input']
+    response = model_predict(user_input)
+    return render_template('index.html', user_input=user_input, answer=response)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+```
+
+至此形成完整闭环：**原始对话数据 → 预处理与数据加载 → GPT-2 训练与验证 → 模型部署与 Web 交互**。
 
 ## ✨ 功能特点
 
